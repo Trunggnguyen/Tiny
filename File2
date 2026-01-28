@@ -1,0 +1,252 @@
+package com.android.server.maxpower;
+
+import android.app.ActivityManager;
+import android.app.usage.UsageEvents;
+import android.content.*;
+import android.content.pm.PackageManager;
+import android.os.*;
+import android.util.AtomicFile;
+import android.util.Slog;
+
+import com.android.server.SystemService;
+
+import java.io.File;
+import java.util.*;
+
+/**
+ * SystemServer service:
+ * - listens for foreground changes (you already have this hook)
+ * - creates a pending "A opened" window
+ * - learns from the next foreground app within T seconds
+ * - predicts and (optionally) auto-opens B
+ */
+public final class AppChainManagerService extends SystemService {
+    private static final String TAG = "AppChainManagerService";
+
+    // Pending window to consider "next app"
+    private static final long NEXT_APP_WINDOW_MS = 15_000;
+
+    // Trigger thresholds
+    private static final float TRIGGER_THRESHOLD = 0.80f;
+
+    // Guard rails
+    private static final long COOLDOWN_MS = 15_000;
+    private static final long ANTI_LOOP_MS = 30_000;
+
+    private final Object mLock = new Object();
+
+    private Context mContext;
+    private PackageManager mPm;
+    private TinyNextAppPredictor mPredictor;
+
+    // Pending record when A goes to foreground.
+    private Pending mPending;
+
+    // last chain action (anti-loop/cooldown)
+    private String mLastChainFrom;
+    private String mLastChainTo;
+    private long mLastChainUptimeMs;
+
+    // simple in-memory allowlist (replace with DeviceConfig/overlay/settings)
+    private final ArraySet<String> mAllowed = new ArraySet<>();
+
+    private static final class Pending {
+        final int userId;
+        final long uptimeMs;
+        final TinyNextAppPredictor.Ctx ctx;
+        final boolean userInitiated; // you must set this from your own signal
+        Pending(int userId, long uptimeMs, TinyNextAppPredictor.Ctx ctx, boolean userInitiated) {
+            this.userId = userId;
+            this.uptimeMs = uptimeMs;
+            this.ctx = ctx;
+            this.userInitiated = userInitiated;
+        }
+    }
+
+    public AppChainManagerService(Context context) {
+        super(context);
+    }
+
+    @Override
+    public void onStart() {
+        mContext = getContext();
+        mPm = mContext.getPackageManager();
+
+        // Model file per device; if per user, put userId into filename
+        File dir = new File(Environment.getDataSystemDirectory(), "maxpower");
+        dir.mkdirs();
+        AtomicFile file = new AtomicFile(new File(dir, "next_app_model.bin"));
+        mPredictor = new TinyNextAppPredictor(file);
+        mPredictor.load();
+
+        // Example allowlist
+        // TODO: load from config
+        mAllowed.add("com.example.appB");
+        mAllowed.add("com.example.appC");
+
+        publishLocalService(AppChainManagerInternal.class, new LocalImpl());
+        Slog.i(TAG, "Started.");
+    }
+
+    /** Internal API your other framework code can call. */
+    public abstract static class AppChainManagerInternal {
+        public abstract void onForegroundChanged(String topPkg, int userId, boolean userInitiated,
+                                                 boolean isUnlocked, int netType,
+                                                 int hourBucket, int dow,
+                                                 String lastPkg);
+        public abstract void setMaxPowerEnabled(boolean enabled);
+    }
+
+    private final class LocalImpl extends AppChainManagerInternal {
+        private volatile boolean mMaxPowerEnabled = false;
+
+        @Override
+        public void setMaxPowerEnabled(boolean enabled) {
+            mMaxPowerEnabled = enabled;
+        }
+
+        @Override
+        public void onForegroundChanged(String topPkg, int userId, boolean userInitiated,
+                                        boolean isUnlocked, int netType,
+                                        int hourBucket, int dow,
+                                        String lastPkg) {
+            if (topPkg == null) return;
+
+            // 1) learn: if there is a pending A, then topPkg is the "next app"
+            handleLearningIfPending(topPkg, userId);
+
+            // 2) create new pending for current topPkg (A)
+            TinyNextAppPredictor.Ctx ctx = new TinyNextAppPredictor.Ctx(
+                    topPkg, lastPkg, hourBucket, dow, netType, isUnlocked);
+
+            synchronized (mLock) {
+                mPending = new Pending(userId, SystemClock.uptimeMillis(), ctx, userInitiated);
+            }
+
+            // 3) predict & maybe trigger chain open (only in MaxPower, user-initiated)
+            if (!mMaxPowerEnabled) return;
+            if (!userInitiated) return;
+            if (!isUnlocked) return;
+
+            maybeTriggerChain(ctx, userId);
+        }
+    }
+
+    private void handleLearningIfPending(String nextPkg, int userId) {
+        Pending p;
+        synchronized (mLock) {
+            p = mPending;
+        }
+        if (p == null) return;
+        if (p.userId != userId) return;
+
+        final long now = SystemClock.uptimeMillis();
+        if (now - p.uptimeMs > NEXT_APP_WINDOW_MS) return;
+
+        final String pkgA = p.ctx.pkgA;
+        if (pkgA == null || pkgA.equals(nextPkg)) return;
+
+        // Train: positive example for real nextPkg
+        synchronized (mLock) {
+            mPredictor.train(p.ctx, nextPkg, 1);
+
+            // Negative sampling: choose a few other candidates (not equal to nextPkg)
+            List<String> negs = pickNegativeCandidates(pkgA, nextPkg);
+            for (int i = 0; i < negs.size(); i++) {
+                mPredictor.train(p.ctx, negs.get(i), 0);
+            }
+
+            mPredictor.maybeSave();
+        }
+    }
+
+    private List<String> pickNegativeCandidates(String pkgA, String realNext) {
+        // Keep it tiny. You can sample from allowlist or from recent apps.
+        ArrayList<String> out = new ArrayList<>(3);
+        for (int i = 0; i < mAllowed.size() && out.size() < 3; i++) {
+            String c = mAllowed.valueAt(i);
+            if (!realNext.equals(c) && !pkgA.equals(c)) out.add(c);
+        }
+        return out;
+    }
+
+    private void maybeTriggerChain(TinyNextAppPredictor.Ctx ctx, int userId) {
+        // Candidates: allowlist only (replace with smarter candidate gen later)
+        String best = null;
+        float bestP = 0f;
+
+        synchronized (mLock) {
+            for (int i = 0; i < mAllowed.size(); i++) {
+                String cand = mAllowed.valueAt(i);
+                if (cand.equals(ctx.pkgA)) continue;
+
+                float p = mPredictor.inferProbability(ctx, cand);
+                if (p > bestP) {
+                    bestP = p;
+                    best = cand;
+                }
+            }
+        }
+
+        if (best == null || bestP < TRIGGER_THRESHOLD) return;
+
+        if (!passesGuards(ctx.pkgA, best)) return;
+
+        // You likely want a small delay so A is fully resumed
+        Handler h = new Handler(Looper.getMainLooper());
+        final String pkgB = best;
+        h.postDelayed(() -> {
+            // NOTE: add unsuspend if needed
+            launchApp(pkgB, userId);
+
+            synchronized (mLock) {
+                mLastChainFrom = ctx.pkgA;
+                mLastChainTo = pkgB;
+                mLastChainUptimeMs = SystemClock.uptimeMillis();
+            }
+        }, 400);
+    }
+
+    private boolean passesGuards(String pkgA, String pkgB) {
+        final long now = SystemClock.uptimeMillis();
+        synchronized (mLock) {
+            // cooldown for any chain
+            if (now - mLastChainUptimeMs < COOLDOWN_MS) return false;
+
+            // anti-loop: prevent A->B then B->A quickly
+            if (mLastChainFrom != null && mLastChainTo != null) {
+                if (now - mLastChainUptimeMs < ANTI_LOOP_MS) {
+                    if (pkgA.equals(mLastChainTo) && pkgB.equals(mLastChainFrom)) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Basic filters
+        if (!mAllowed.contains(pkgB)) return false;
+        if (isBadTarget(pkgB)) return false;
+        return true;
+    }
+
+    private boolean isBadTarget(String pkg) {
+        // TODO: exclude SystemUI, launcher, IME, Settings, etc.
+        // You can query package category, UID, etc.
+        return "com.android.systemui".equals(pkg);
+    }
+
+    private void launchApp(String pkg, int userId) {
+        Intent launch = mPm.getLaunchIntentForPackage(pkg);
+        if (launch == null) {
+            Slog.w(TAG, "No launch intent for " + pkg);
+            return;
+        }
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+        try {
+            mContext.startActivityAsUser(launch, UserHandle.of(userId));
+        } catch (Throwable t) {
+            Slog.w(TAG, "Failed to launch " + pkg, t);
+        }
+    }
+}
