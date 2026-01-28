@@ -1,0 +1,234 @@
+package com.android.server.maxpower.chain;
+
+import android.os.SystemClock;
+import android.util.ArrayMap;
+import android.util.AtomicFile;
+import android.util.Slog;
+
+import com.android.server.maxpower.chain.proto.ChainBufferProto;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Collect transitions A->B (already-filtered input) and persist to Proto via AtomicFile.
+ *
+ * - Input: onTransition(A,B)
+ * - Persist: maybeSave() throttled, saveNow() on screen off/shutdown
+ * - Restore: load() at boot/service start
+ *
+ * NOTE: No filtering of system apps/launcher here (caller guarantees).
+ */
+public final class TransitionBufferStore {
+    private static final String TAG = "TransitionBufferStore";
+
+    // ---- Tune knobs ----
+    private final int mMaxPairs;                 // e.g. 10_000
+    private final int mMinEventsBetweenSaves;    // e.g. 200
+    private final long mMinSaveIntervalMs;       // e.g. 60_000
+
+    private final Object mLock = new Object();
+    private final AtomicFile mFile;
+
+    // Map key="A\0B" -> count
+    private final ArrayMap<String, Integer> mCounts = new ArrayMap<>();
+
+    // Save throttle state
+    private boolean mDirty = false;
+    private int mEventsSinceLastSave = 0;
+    private long mLastSaveUptimeMs = 0;
+
+    public TransitionBufferStore(
+            AtomicFile file,
+            int maxPairs,
+            int minEventsBetweenSaves,
+            long minSaveIntervalMs
+    ) {
+        mFile = file;
+        mMaxPairs = maxPairs;
+        mMinEventsBetweenSaves = minEventsBetweenSaves;
+        mMinSaveIntervalMs = minSaveIntervalMs;
+    }
+
+    // -------------------- EVENT INPUT --------------------
+
+    /** Collect transition A->B. Caller guarantees A/B are valid apps. */
+    public void onTransition(String pkgA, String pkgB) {
+        if (pkgA == null || pkgB == null) return;
+        if (pkgA.equals(pkgB)) return;
+
+        synchronized (mLock) {
+            final String key = makeKey(pkgA, pkgB);
+            Integer cur = mCounts.get(key);
+            if (cur == null) cur = 0;
+            mCounts.put(key, cur + 1);
+
+            mDirty = true;
+            mEventsSinceLastSave++;
+
+            if (mCounts.size() > mMaxPairs) {
+                trimToCapLocked();
+            }
+        }
+    }
+
+    // -------------------- PERSIST / LOAD --------------------
+
+    /** Load counts from proto file at boot/startup. */
+    public void load() {
+        synchronized (mLock) {
+            mCounts.clear();
+            mDirty = false;
+            mEventsSinceLastSave = 0;
+        }
+
+        try (FileInputStream fis = mFile.openRead()) {
+            ChainBufferProto.TransitionBuffer proto =
+                    ChainBufferProto.TransitionBuffer.parseFrom(new BufferedInputStream(fis));
+
+            synchronized (mLock) {
+                for (int i = 0; i < proto.getPairsCount(); i++) {
+                    ChainBufferProto.PairCount pc = proto.getPairs(i);
+                    String a = pc.getA();
+                    String b = pc.getB();
+                    int c = pc.getCount();
+                    if (a == null || b == null || c <= 0) continue;
+                    mCounts.put(makeKey(a, b), c);
+                }
+                trimToCapLocked();
+                mLastSaveUptimeMs = SystemClock.uptimeMillis();
+            }
+
+            Slog.i(TAG, "Loaded transition buffer pairs=" + proto.getPairsCount());
+        } catch (FileNotFoundException e) {
+            // first run, no file
+        } catch (IOException e) {
+            Slog.w(TAG, "load() failed", e);
+        }
+    }
+
+    /** Save immediately (call on screen off / shutdown). */
+    public void saveNow() {
+        final ChainBufferProto.TransitionBuffer proto;
+        synchronized (mLock) {
+            proto = buildProtoLocked();
+        }
+        writeProtoAtomic(proto);
+
+        synchronized (mLock) {
+            mDirty = false;
+            mEventsSinceLastSave = 0;
+            mLastSaveUptimeMs = SystemClock.uptimeMillis();
+        }
+    }
+
+    /** Throttled save (call periodically after transitions or on screen off). */
+    public void maybeSave() {
+        final long now = SystemClock.uptimeMillis();
+
+        final boolean should;
+        synchronized (mLock) {
+            if (!mDirty) return;
+
+            boolean byEvents = mEventsSinceLastSave >= mMinEventsBetweenSaves;
+            boolean byTime = (now - mLastSaveUptimeMs) >= mMinSaveIntervalMs;
+
+            should = byEvents || byTime;
+        }
+        if (!should) return;
+
+        saveNow();
+    }
+
+    /** Optional: clear all counts (e.g., after you train & want to reset buffer). */
+    public void clearAndPersistEmpty() {
+        synchronized (mLock) {
+            mCounts.clear();
+            mDirty = true;
+            mEventsSinceLastSave = mMinEventsBetweenSaves; // force save
+        }
+        saveNow();
+    }
+
+    // -------------------- EXPORT FOR TRAINER (OPTIONAL) --------------------
+
+    /**
+     * Optional helper: snapshot for JobService trainer.
+     * Key format: "A\0B" -> count
+     */
+    public ArrayMap<String, Integer> snapshotCounts() {
+        synchronized (mLock) {
+            return new ArrayMap<>(mCounts);
+        }
+    }
+
+    // -------------------- INTERNALS --------------------
+
+    private ChainBufferProto.TransitionBuffer buildProtoLocked() {
+        ChainBufferProto.TransitionBuffer.Builder b =
+                ChainBufferProto.TransitionBuffer.newBuilder()
+                        .setVersion(1)
+                        .setLastWriteUptimeMs(SystemClock.uptimeMillis());
+
+        for (int i = 0; i < mCounts.size(); i++) {
+            String key = mCounts.keyAt(i);
+            int count = mCounts.valueAt(i);
+            if (count <= 0) continue;
+
+            String[] ab = splitKey(key);
+            b.addPairs(ChainBufferProto.PairCount.newBuilder()
+                    .setA(ab[0])
+                    .setB(ab[1])
+                    .setCount(count)
+                    .build());
+        }
+        return b.build();
+    }
+
+    private void writeProtoAtomic(ChainBufferProto.TransitionBuffer proto) {
+        FileOutputStream fos = null;
+        try {
+            fos = mFile.startWrite();
+            proto.writeTo(new BufferedOutputStream(fos));
+            mFile.finishWrite(fos);
+        } catch (IOException e) {
+            Slog.w(TAG, "saveNow() failed", e);
+            if (fos != null) mFile.failWrite(fos);
+        }
+    }
+
+    private static String makeKey(String a, String b) {
+        return a + "\0" + b;
+    }
+
+    private static String[] splitKey(String key) {
+        int idx = key.indexOf('\0');
+        if (idx < 0) return new String[]{key, ""};
+        return new String[]{key.substring(0, idx), key.substring(idx + 1)};
+    }
+
+    /**
+     * Simple pruning: drop smallest counts until under cap.
+     * Skeleton implementation; replace with better pruning if needed.
+     */
+    private void trimToCapLocked() {
+        if (mCounts.size() <= mMaxPairs) return;
+
+        while (mCounts.size() > mMaxPairs) {
+            int minIdx = -1;
+            int minVal = Integer.MAX_VALUE;
+            for (int i = 0; i < mCounts.size(); i++) {
+                int v = mCounts.valueAt(i);
+                if (v < minVal) { minVal = v; minIdx = i; }
+            }
+            if (minIdx >= 0) mCounts.removeAt(minIdx);
+            else break;
+        }
+    }
+}
