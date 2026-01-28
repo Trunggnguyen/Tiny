@@ -1,0 +1,205 @@
+package com.android.server.maxpower;
+
+import android.os.SystemClock;
+import android.util.AtomicFile;
+import android.util.Slog;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Tiny on-device next-app predictor:
+ * Logistic Regression with hashing trick, online SGD updates.
+ *
+ * Threading: call infer/train under a lock from service.
+ */
+public final class TinyNextAppPredictor {
+    private static final String TAG = "TinyNextAppPredictor";
+
+    // Model size: keep small for SystemServer.
+    private static final int D = 2048; // power of two is nice but not required.
+    private static final float DEFAULT_LR = 0.05f;
+    private static final float L2_LAMBDA = 1e-5f;
+
+    private final float[] mW = new float[D];
+    private long mUpdateCount = 0;
+
+    private final AtomicFile mFile;
+
+    // Save throttling
+    private long mLastSaveUptimeMs = 0;
+    private static final long MIN_SAVE_INTERVAL_MS = 10 * 60 * 1000; // 10 min
+    private static final long MIN_UPDATES_BETWEEN_SAVES = 50;
+
+    public TinyNextAppPredictor(AtomicFile file) {
+        mFile = file;
+    }
+
+    /** Context snapshot used for both inference and training. */
+    public static final class Ctx {
+        public final String pkgA;
+        public final String lastPkg;
+        public final int hourBucket; // 0..3
+        public final int dow;        // 0..6
+        public final int netType;    // 0 none, 1 wifi, 2 cell
+        public final boolean unlocked;
+
+        public Ctx(String pkgA, String lastPkg, int hourBucket, int dow, int netType, boolean unlocked) {
+            this.pkgA = pkgA;
+            this.lastPkg = lastPkg;
+            this.hourBucket = hourBucket;
+            this.dow = dow;
+            this.netType = netType;
+            this.unlocked = unlocked;
+        }
+    }
+
+    /** Predict probability that candidate pkgB is the next app given context. */
+    public float inferProbability(Ctx ctx, String pkgB) {
+        final int[] idx = buildFeatureIdx(ctx, pkgB);
+        float z = 0f;
+        for (int i = 0; i < idx.length; i++) {
+            z += mW[idx[i]];
+        }
+        return sigmoid(z);
+    }
+
+    /**
+     * Train once using (ctx, pkgB, label).
+     * label: 1 for actual next app, 0 for negatives.
+     */
+    public void train(Ctx ctx, String pkgB, int label) {
+        final int[] idx = buildFeatureIdx(ctx, pkgB);
+        float z = 0f;
+        for (int i = 0; i < idx.length; i++) z += mW[idx[i]];
+        final float p = sigmoid(z);
+        final float y = (label != 0) ? 1f : 0f;
+        final float err = (y - p);
+
+        // simple lr schedule: decay slowly with updates
+        final float lr = (float) (DEFAULT_LR / (1.0 + 0.0005 * mUpdateCount));
+
+        // SGD update with tiny L2
+        for (int i = 0; i < idx.length; i++) {
+            int k = idx[i];
+            float w = mW[k];
+            w = w * (1f - lr * L2_LAMBDA) + lr * err;
+            mW[k] = w;
+        }
+
+        mUpdateCount++;
+    }
+
+    /** Optional: apply global decay to forget old habits. Call maybe daily. */
+    public void applyDecay(float factor /* e.g. 0.999f */) {
+        for (int i = 0; i < mW.length; i++) {
+            mW[i] *= factor;
+        }
+    }
+
+    /** Load model from /data/system... safe to call at boot. */
+    public void load() {
+        try {
+            FileInputStream fis = mFile.openRead();
+            DataInputStream in = new DataInputStream(new BufferedInputStream(fis));
+            int d = in.readInt();
+            if (d != D) {
+                Slog.w(TAG, "Model D mismatch. expected=" + D + " got=" + d + ", reset.");
+                in.close();
+                return;
+            }
+            long updates = in.readLong();
+            for (int i = 0; i < D; i++) {
+                mW[i] = in.readFloat();
+            }
+            mUpdateCount = updates;
+            in.close();
+            Slog.i(TAG, "Loaded model, updates=" + mUpdateCount);
+        } catch (FileNotFoundException e) {
+            Slog.i(TAG, "No model file yet.");
+        } catch (IOException e) {
+            Slog.w(TAG, "Failed to load model, reset.", e);
+        }
+    }
+
+    /** Save model occasionally (throttled). Call from service after training bursts. */
+    public void maybeSave() {
+        final long now = SystemClock.uptimeMillis();
+        if ((mUpdateCount % MIN_UPDATES_BETWEEN_SAVES) != 0) return;
+        if (now - mLastSaveUptimeMs < MIN_SAVE_INTERVAL_MS) return;
+        saveNow();
+        mLastSaveUptimeMs = now;
+    }
+
+    public void saveNow() {
+        FileOutputStream fos = null;
+        try {
+            fos = mFile.startWrite();
+            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(fos));
+            out.writeInt(D);
+            out.writeLong(mUpdateCount);
+            for (int i = 0; i < D; i++) out.writeFloat(mW[i]);
+            out.flush();
+            mFile.finishWrite(fos);
+        } catch (IOException e) {
+            Slog.w(TAG, "Failed to save model", e);
+            if (fos != null) mFile.failWrite(fos);
+        }
+    }
+
+    // ----------------- Features & hashing -----------------
+
+    private int[] buildFeatureIdx(Ctx ctx, String pkgB) {
+        // Keep feature count small.
+        ArrayList<Integer> list = new ArrayList<>(12);
+
+        add(list, "A=" + ctx.pkgA);
+        add(list, "B=" + pkgB);
+        add(list, "A2B=" + ctx.pkgA + "->" + pkgB);
+
+        if (ctx.lastPkg != null) {
+            add(list, "L=" + ctx.lastPkg);
+            add(list, "L2B=" + ctx.lastPkg + "->" + pkgB);
+        }
+
+        add(list, "H=" + ctx.hourBucket);
+        add(list, "DOW=" + ctx.dow);
+        add(list, "NET=" + ctx.netType);
+        add(list, "UNLOCK=" + (ctx.unlocked ? 1 : 0));
+
+        // bias term
+        add(list, "BIAS");
+
+        // convert
+        int[] idx = new int[list.size()];
+        for (int i = 0; i < list.size(); i++) idx[i] = list.get(i);
+        return idx;
+    }
+
+    private void add(List<Integer> out, String key) {
+        out.add(hashToIndex(key));
+    }
+
+    private int hashToIndex(String s) {
+        // FNV-1a 32-bit hash (stable, fast, no allocations beyond string bytes)
+        byte[] b = s.getBytes(StandardCharsets.UTF_8);
+        int h = 0x811c9dc5;
+        for (int i = 0; i < b.length; i++) {
+            h ^= (b[i] & 0xff);
+            h *= 0x01000193;
+        }
+        // Map to [0..D-1]
+        int idx = h % D;
+        if (idx < 0) idx += D;
+        return idx;
+    }
+
+    private static float sigmoid(float z) {
+        // prevent overflow
+        if (z > 20f) return 1f;
+        if (z < -20f) return 0f;
+        return (float) (1.0 / (1.0 + Math.exp(-z)));
+    }
+}
