@@ -1,0 +1,13 @@
+AppChainManagerService.AppChainManagerInternal svc =
+        LocalServices.getService(AppChainManagerService.AppChainManagerInternal.class);
+
+svc.onForegroundChanged(
+        topPkg,
+        userId,
+        userInitiated,   // bạn tự xác định
+        isUnlocked,      // Keyguard state
+        netType,         // 0/1/2
+        hourBucket,      // 0..3
+        dow,             // 0..6
+        lastPkg          // package foreground trước đó (nếu có)
+);
